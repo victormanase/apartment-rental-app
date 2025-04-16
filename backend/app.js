@@ -15,7 +15,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 const dbConfig = {
   host: 'mysql',
   user: 'root',
-  password: 'password',
+  password: '12345678',
   database: 'apartment_db'
 };
 
