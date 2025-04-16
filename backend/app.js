@@ -1,5 +1,5 @@
 const express = require('express');
-const mongoose = require('mongoose');
+const mysql = require('mysql2/promise');
 const cors = require('cors');
 const multer = require('multer');
 const jwt = require('jsonwebtoken');
@@ -11,49 +11,32 @@ app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-mongoose.connect('mongodb://mongo:27017/apartment_db', { useNewUrlParser: true, useUnifiedTopology: true });
-
-const User = mongoose.model('User', new mongoose.Schema({
-  username: String,
-  password: String,
-  name: String
-}));
-
-const Unit = mongoose.model('Unit', new mongoose.Schema({
-  unitId: String,
-  unitName: String,
-  unitSize: String,
-  rentAmount: Number,
-  conditionImages: [String]
-}));
-
-const Tenant = mongoose.model('Tenant', new mongoose.Schema({
-  firstName: String,
-  middleName: String,
-  lastName: String,
-  phoneNumber: String,
-  unitId: String,
-  moveInDate: Date
-}));
-
-const Rent = mongoose.model('Rent', new mongoose.Schema({
-  tenantId: String,
-  unitId: String,
-  paidAmount: Number,
-  rentStartDate: Date,
-  rentEndDate: Date
-}));
-
-const authenticateToken = (req, res, next) => {
-  const token = req.headers['authorization'];
-  if (!token) return res.sendStatus(401);
-  jwt.verify(token, 'SECRET_KEY', (err, user) => {
-    if (err) return res.sendStatus(403);
-    req.user = user;
-    next();
-  });
+// MySQL connection
+const dbConfig = {
+  host: 'mysql',
+  user: 'root',
+  password: 'password',
+  database: 'apartment_db'
 };
 
+// Create seed user
+(async () => {
+  try {
+    const conn = await mysql.createConnection(dbConfig);
+    const [rows] = await conn.execute('SELECT * FROM users WHERE username = ?', ['admin']);
+    if (rows.length === 0) {
+      const hashedPassword = await bcrypt.hash('admin123', 10);
+      await conn.execute('INSERT INTO users (username, password, name) VALUES (?, ?, ?)', ['admin', hashedPassword, 'Admin User']);
+      console.log('Seed admin user created');
+    } else {
+      console.log('Admin user already exists');
+    }
+  } catch (err) {
+    console.error('Error seeding user:', err);
+  }
+})();
+
+// Multer setup for file upload
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
     const uploadDir = './uploads';
@@ -66,19 +49,30 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage: storage });
 
+const authenticateToken = (req, res, next) => {
+  const token = req.headers['authorization'];
+  if (!token) return res.sendStatus(401);
+  jwt.verify(token, 'SECRET_KEY', (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user;
+    next();
+  });
+};
+
 app.post('/auth/register', async (req, res) => {
   const { username, password, name } = req.body;
   const hashedPassword = await bcrypt.hash(password, 10);
-  const user = new User({ username, password: hashedPassword, name });
-  await user.save();
+  const conn = await mysql.createConnection(dbConfig);
+  await conn.execute('INSERT INTO users (username, password, name) VALUES (?, ?, ?)', [username, hashedPassword, name]);
   res.send('User registered');
 });
 
 app.post('/auth/login', async (req, res) => {
   const { username, password } = req.body;
-  const user = await User.findOne({ username });
-  if (user && await bcrypt.compare(password, user.password)) {
-    const token = jwt.sign({ username: user.username }, 'SECRET_KEY');
+  const conn = await mysql.createConnection(dbConfig);
+  const [rows] = await conn.execute('SELECT * FROM users WHERE username = ?', [username]);
+  if (rows.length && await bcrypt.compare(password, rows[0].password)) {
+    const token = jwt.sign({ username: rows[0].username }, 'SECRET_KEY');
     res.json({ token });
   } else {
     res.status(401).send('Invalid credentials');
@@ -87,10 +81,11 @@ app.post('/auth/login', async (req, res) => {
 
 app.post('/users/reset', authenticateToken, async (req, res) => {
   const { username, newPassword } = req.body;
-  const user = await User.findOne({ username });
-  if (user) {
-    user.password = await bcrypt.hash(newPassword, 10);
-    await user.save();
+  const hashedPassword = await bcrypt.hash(newPassword, 10);
+  const conn = await mysql.createConnection(dbConfig);
+  const [rows] = await conn.execute('SELECT * FROM users WHERE username = ?', [username]);
+  if (rows.length) {
+    await conn.execute('UPDATE users SET password = ? WHERE username = ?', [hashedPassword, username]);
     res.send('Password reset');
   } else {
     res.status(404).send('User not found');
@@ -98,34 +93,40 @@ app.post('/users/reset', authenticateToken, async (req, res) => {
 });
 
 app.delete('/users/delete/:username', authenticateToken, async (req, res) => {
-  await User.deleteOne({ username: req.params.username });
+  const conn = await mysql.createConnection(dbConfig);
+  await conn.execute('DELETE FROM users WHERE username = ?', [req.params.username]);
   res.send('User deleted');
 });
 
 app.post('/units/create', authenticateToken, upload.array('conditionImages', 5), async (req, res) => {
-  const imagePaths = req.files.map(file => `/uploads/${file.filename}`);
+  const imagePaths = req.files.map(file => `/uploads/${file.filename}`).join(',');
   const { unitId, unitName, unitSize, rentAmount } = req.body;
-  const unit = new Unit({ unitId, unitName, unitSize, rentAmount, conditionImages: imagePaths });
-  await unit.save();
-  res.send(unit);
+  const conn = await mysql.createConnection(dbConfig);
+  await conn.execute('INSERT INTO units (unitId, unitName, unitSize, rentAmount, conditionImages) VALUES (?, ?, ?, ?, ?)',
+    [unitId, unitName, unitSize, rentAmount, imagePaths]);
+  res.send('Unit registered');
 });
 
 app.post('/tenants/register', authenticateToken, async (req, res) => {
-  const tenant = new Tenant(req.body);
-  await tenant.save();
-  res.send(tenant);
+  const { firstName, middleName, lastName, phoneNumber, unitId, moveInDate } = req.body;
+  const conn = await mysql.createConnection(dbConfig);
+  await conn.execute('INSERT INTO tenants (firstName, middleName, lastName, phoneNumber, unitId, moveInDate) VALUES (?, ?, ?, ?, ?, ?)',
+    [firstName, middleName, lastName, phoneNumber, unitId, moveInDate]);
+  res.send('Tenant registered');
 });
 
 app.post('/rent/collect', authenticateToken, async (req, res) => {
-  const rent = new Rent(req.body);
-  await rent.save();
-  res.send(rent);
+  const { tenantId, unitId, paidAmount, rentStartDate, rentEndDate } = req.body;
+  const conn = await mysql.createConnection(dbConfig);
+  await conn.execute('INSERT INTO rents (tenantId, unitId, paidAmount, rentStartDate, rentEndDate) VALUES (?, ?, ?, ?, ?)',
+    [tenantId, unitId, paidAmount, rentStartDate, rentEndDate]);
+  res.send('Rent collected');
 });
 
 app.get('/notifications', authenticateToken, async (req, res) => {
-  const today = new Date();
-  const dueRents = await Rent.find({ rentEndDate: { $lt: today } });
-  res.send(dueRents);
+  const conn = await mysql.createConnection(dbConfig);
+  const [rows] = await conn.execute('SELECT * FROM rents WHERE rentEndDate < NOW()');
+  res.send(rows);
 });
 
 app.listen(3000, () => console.log('Server running on port 3000'));
